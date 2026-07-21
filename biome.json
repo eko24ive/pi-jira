@@ -1,0 +1,44 @@
+{
+	"$schema": "./node_modules/@biomejs/biome/configuration_schema.json",
+	"vcs": {
+		"enabled": true,
+		"clientKind": "git",
+		"useIgnoreFile": true
+	},
+	"formatter": {
+		"enabled": true,
+		"indentStyle": "tab",
+		"lineWidth": 160
+	},
+	"linter": {
+		"enabled": true,
+		"rules": {
+			"recommended": true,
+			"suspicious": {
+				"noControlCharactersInRegex": "off",
+				"noImplicitAnyLet": "off"
+			}
+		}
+	},
+	"javascript": {
+		"formatter": {
+			"quoteStyle": "double"
+		}
+	},
+	"overrides": [
+		{
+			"includes": ["test/**/*.ts"],
+			"linter": {
+				"rules": {
+					"suspicious": {
+						"noExplicitAny": "off",
+						"useAwait": "off"
+					}
+				}
+			}
+		}
+	],
+	"assist": {
+		"enabled": false
+	}
+}
