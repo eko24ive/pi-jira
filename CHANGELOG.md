@@ -1,3 +1,3 @@
 # Changelog
 
-All notable changes to this project will be documented here by semantic-release.
+Notable changes to this project are documented here.

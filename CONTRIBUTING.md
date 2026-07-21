@@ -19,4 +19,4 @@ pnpm test
 pnpm build:smoke
 ```
 
-This project uses conventional commits and semantic-release. Keep changes focused, preserve the explicit-approval contract for Jira mutations, and update the README when public behavior changes.
+Use conventional commits. Keep changes focused, preserve the explicit-approval contract for Jira mutations, and update the README when public behavior changes.
