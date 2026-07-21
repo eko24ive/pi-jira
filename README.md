@@ -1,49 +1,20 @@
 # @eko24ive/pi-jira
 
-[![npm downloads](https://badgen.net/npm/dm/@eko24ive/pi-jira)](https://www.npmjs.com/package/@eko24ive/pi-jira)
-[![last commit](https://badgen.net/github/last-commit/eko24ive/pi-jira)](https://github.com/eko24ive/pi-jira/commits/main)
-[![stars](https://badgen.net/github/stars/eko24ive/pi-jira)](https://github.com/eko24ive/pi-jira/stargazers)
-
 Pi package for Jira Cloud work from mapped local workspaces. It exposes named Jira tools for search, reads, issue creation, exports, attachment downloads, comments, issue edits, transitions, and issue links.
 
 ## Install
 
 ```bash
-pi install npm:@eko24ive/pi-jira
+pi install git:github.com/eko24ive/pi-jira
 ```
 
-You can also install from GitHub or try it for one run:
+Try it for one run without installing:
 
 ```bash
-pi install git:github.com/eko24ive/pi-jira
-pi -e npm:@eko24ive/pi-jira
+pi -e git:github.com/eko24ive/pi-jira
 ```
 
 This extension is deliberately **not** a generic Jira REST client, storage manager, workflow orchestrator, or custom approval UI.
-
-## Re-entry guide
-
-If you come back to this later, start here:
-
-```txt
-cwd -> ~/.pi/agent/jira.json workspace -> profile -> Jira Cloud REST v3
-```
-
-Typical agent flow:
-
-```txt
-jira_search with explicit JQL -> jira_get_issue / jira_get_comments -> optional export/download -> ask user -> write tool
-```
-
-Use Jira tools when the task is Jira-specific:
-
-- search issues with JQL;
-- inspect issue fields, comments, attachments, links, transitions, and create metadata;
-- create issues after explicit user approval;
-- export issue/comment text for offline reading;
-- download a specific attachment after naming its issue and attachment id;
-- add/update/delete comments after explicit user approval;
-- edit/assign/transition/link issues after explicit user approval.
 
 ## Why this exists
 
@@ -317,78 +288,12 @@ Jira descriptions/comments use Atlassian Document Format.
 - `textToAdf` linkifies Markdown-style links and bare `https://...` URLs.
 - There is no general Markdown parser in v1.
 
-## Maintenance map
+## Maintenance
 
-Entrypoint and registration:
-
-- `index.ts` — tiny extension entrypoint.
-- `src/tools.ts` — Pi tool descriptors, shared registration wrapper, write-tool approval text.
-
-Core runtime:
-
-- `src/config.ts` — global config parsing and cwd-to-workspace resolution.
-- `src/client.ts` — Jira REST JSON and download client.
-- `src/issues.ts` — issue/comment/search helpers.
-- `src/create.ts` — create metadata, create issue payload normalization, string description ADF conversion.
-
-Formatting and export:
-
-- `src/adf.ts` — best-effort ADF text conversion and plain-text comment ADF.
-- `src/format.ts` — compact issue/comment/link/transition summaries and Markdown.
-- `src/exporter.ts` — export run paths, file writes, truncation full-output files.
-- `src/types.ts` — config, workspace, narrow Jira DTO/view types.
-
-## Maintenance invariants
-
-Keep these intact:
-
-- no project-local Jira config;
-- no env-var indirection for Jira credentials;
-- no default JQL; `jira_search` requires explicit `jql`;
-- no generic exposed `jira_request` tool;
-- create/edit payloads stay raw Jira fields/update payloads except string descriptions are converted to Jira ADF;
-- no custom confirmation UI;
-- write tools must centrally include the explicit approval line;
-- comment bodies should render useful links via Markdown-style links or bare URLs;
-- attachment bodies are never downloaded by issue read/export tools;
-- downloads require both `issueKey` and `attachmentId`;
-- tool failures throw, not success-return error text;
-- model-visible output stays bounded;
-- file writes go through Pi's mutation queue;
-- do not print or log the API token.
-
-## Development workflow
-
-From this directory:
-
-```bash
-pnpm install
-pnpm format
-pnpm test
-pnpm build:smoke
-pi --no-extensions -e ./index.ts
-```
-
-Before calling work done:
-
-1. Run the extension load smoke check.
-2. Run a mocked `jira_search` check with explicit JQL.
-3. Run mocked `jira_get_createmeta` and `jira_create_issue` checks if create code changed.
-4. Run a mocked `jira_export_issue` check if export code changed.
-5. Re-read changed code for token leakage, fake-success errors, broad permission policy, and unbounded output.
+See [docs/maintenance.md](docs/maintenance.md) for the code map, invariants, and development workflow.
 
 ## Requirements
 
 - Pi extension runtime.
 - Jira Cloud site.
 - Atlassian API token from `https://id.atlassian.com/manage-profile/security/api-tokens`.
-
-## Local development / reload
-
-Pi also auto-discovers a development checkout at:
-
-```txt
-~/.pi/agent/extensions/jira/index.ts
-```
-
-Run `/reload` in Pi after editing extension code or config.
