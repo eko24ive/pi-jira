@@ -1,14 +1,14 @@
 /**
  * Jira export filesystem helpers.
  *
- * Exports are append-only run directories. This module writes issue/comment text
- * and attachment metadata, but never attachment bodies.
+ * Exports are append-only run directories containing issue and comment files.
+ * Attachment metadata remains embedded in the issue JSON/Markdown.
  */
 import { randomBytes } from "node:crypto";
 import { mkdir, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, formatSize, truncateHead, withFileMutationQueue } from "@earendil-works/pi-coding-agent";
-import { attachmentMetadata, commentsMarkdown, issueMarkdown } from "./format.js";
+import { commentsMarkdown, issueMarkdown } from "./format.js";
 import { fetchAllComments, fetchIssue } from "./issues.js";
 import { DEFAULT_ISSUE_FIELDS, type ExportedIssuePaths, type JiraWorkspace } from "./types.js";
 
@@ -32,17 +32,10 @@ export function safeFileName(name: string, fallback: string): string {
 	return sanitized;
 }
 
-async function writeJsonFile(path: string, data: unknown): Promise<void> {
+export async function writeExportFile(path: string, content: string): Promise<void> {
 	await withFileMutationQueue(path, async () => {
 		await mkdir(dirname(path), { recursive: true });
-		await writeFile(path, `${JSON.stringify(data, null, 2)}\n`, "utf8");
-	});
-}
-
-async function writeTextFile(path: string, data: string): Promise<void> {
-	await withFileMutationQueue(path, async () => {
-		await mkdir(dirname(path), { recursive: true });
-		await writeFile(path, data, "utf8");
+		await writeFile(path, content, "utf8");
 	});
 }
 
@@ -58,9 +51,6 @@ export async function exportIssueIntoRun(workspace: JiraWorkspace, issueKey: str
 	const issue = await fetchIssue(workspace, issueKey, DEFAULT_ISSUE_FIELDS, undefined, signal);
 	const comments = await fetchAllComments(workspace, issue.key, signal);
 	const issueDir = join(runDir, safeFileName(issue.key, "issue"));
-	const attachmentsDir = join(issueDir, "attachments");
-	await mkdir(attachmentsDir, { recursive: true });
-
 	const paths: ExportedIssuePaths = {
 		issueKey: issue.key,
 		directory: issueDir,
@@ -68,27 +58,19 @@ export async function exportIssueIntoRun(workspace: JiraWorkspace, issueKey: str
 		issueMarkdown: join(issueDir, "issue.md"),
 		commentsJson: join(issueDir, "comments.json"),
 		commentsMarkdown: join(issueDir, "comments.md"),
-		attachmentsJson: join(issueDir, "attachments.json"),
-		attachmentsDirectory: attachmentsDir,
 	};
 
-	await writeJsonFile(paths.issueJson, issue);
-	await writeTextFile(paths.issueMarkdown, issueMarkdown(issue));
-	await writeJsonFile(paths.commentsJson, comments);
-	await writeTextFile(paths.commentsMarkdown, commentsMarkdown(issue.key, comments));
-	await writeJsonFile(paths.attachmentsJson, attachmentMetadata(issue));
+	await writeExportFile(paths.issueJson, `${JSON.stringify(issue, null, 2)}\n`);
+	await writeExportFile(paths.issueMarkdown, issueMarkdown(issue));
+	await writeExportFile(paths.commentsJson, `${JSON.stringify(comments, null, 2)}\n`);
+	await writeExportFile(paths.commentsMarkdown, commentsMarkdown(issue.key, comments));
 
 	return paths;
 }
 
-/** Write an export manifest through the shared file mutation queue. */
-export async function writeManifest(path: string, manifest: unknown): Promise<void> {
-	await writeJsonFile(path, manifest);
-}
-
 async function saveFullToolOutput(workspace: JiraWorkspace, text: string): Promise<string> {
 	const file = join(workspace.exportBaseDir, "tool-output", `${timestampForPath()}-${randomSuffix()}.txt`);
-	await writeTextFile(file, text);
+	await writeExportFile(file, text);
 	return file;
 }
 

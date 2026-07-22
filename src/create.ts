@@ -5,7 +5,7 @@
  * Jira's raw create payload while providing two small conveniences: metadata
  * inspection and string-description to ADF conversion.
  */
-import { textToAdf } from "./adf.js";
+import { normalizeDescriptionField } from "./adf.js";
 import { jiraJson } from "./client.js";
 import { browseUrl } from "./format.js";
 import type { JiraWorkspace, TextOutput } from "./types.js";
@@ -31,7 +31,6 @@ export type CreateIssueParams = {
 type CreateMetaField = { name?: string; required?: boolean };
 type CreateMetaIssueType = { id?: string; name?: string; fields?: Record<string, CreateMetaField> };
 type CreateMetaProject = { id?: string; key?: string; name?: string; issuetypes?: CreateMetaIssueType[] };
-type JiraCreatedIssue = { id?: string; key?: string; self?: string };
 
 function uniqueStrings(values: string[]): string[] {
 	return [...new Set(values.map((value) => value.trim()).filter(Boolean))];
@@ -73,10 +72,8 @@ function summarizeCreateMeta(response: Record<string, unknown>): string {
 
 function normalizeCreateFields(fields: JiraPayload): JiraPayload {
 	if (!isRecord(fields)) throw new Error("jira_create_issue requires fields to be an object.");
-	const normalized = { ...fields };
-	if (Object.keys(normalized).length === 0) throw new Error("jira_create_issue requires at least one create field.");
-	if (typeof normalized.description === "string") normalized.description = textToAdf(normalized.description);
-	return normalized;
+	if (Object.keys(fields).length === 0) throw new Error("jira_create_issue requires at least one create field.");
+	return normalizeDescriptionField(fields);
 }
 
 function createIssueBody(params: CreateIssueParams): Record<string, unknown> {
@@ -91,18 +88,23 @@ function createIssueBody(params: CreateIssueParams): Record<string, unknown> {
 
 /** Fetch Jira's project/type-specific create fields and return a compact required-field summary. */
 export async function getCreateMetadata(workspace: JiraWorkspace, params: CreateMetaParams, signal?: AbortSignal): Promise<TextOutput> {
-	const createmeta = await jiraJson<Record<string, unknown>>(workspace, "GET", "/issue/createmeta", { query: createMetaQuery(params), signal });
+	const response = await jiraJson(workspace, "GET", "/issue/createmeta", { query: createMetaQuery(params), signal });
+	if (!isRecord(response)) throw new Error("Jira create metadata returned an invalid object response.");
+	const createmeta = response;
+	if (!Array.isArray(createmeta.projects)) throw new Error("Jira create metadata returned an invalid projects response.");
 	return { text: summarizeCreateMeta(createmeta), details: { createmeta } };
 }
 
 /** Create one Jira issue using Jira's raw create payload shape. */
 export async function createIssue(workspace: JiraWorkspace, params: CreateIssueParams, signal?: AbortSignal): Promise<TextOutput> {
 	const body = createIssueBody(params);
-	const created = await jiraJson<JiraCreatedIssue>(workspace, "POST", "/issue", { body, signal });
-	const issueKey = created.key ?? created.id ?? "unknown";
-	const issueUrl = created.key ? browseUrl(workspace, created.key) : created.self;
+	const response = await jiraJson(workspace, "POST", "/issue", { body, signal });
+	if (!isRecord(response)) throw new Error("Jira create issue returned an invalid object response.");
+	const issueKey = typeof response.key === "string" ? response.key : typeof response.id === "string" ? response.id : undefined;
+	if (!issueKey) throw new Error("Jira create issue returned no issue key or id.");
+	const issueUrl = typeof response.key === "string" ? browseUrl(workspace, response.key) : typeof response.self === "string" ? response.self : undefined;
 	return {
 		text: `Created Jira issue ${issueKey}${issueUrl ? `\nURL: ${issueUrl}` : ""}`,
-		details: { created, body },
+		details: { created: response, body },
 	};
 }

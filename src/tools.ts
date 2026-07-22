@@ -5,21 +5,20 @@
  * owns shared behavior: workspace resolution, model-visible output bounding, and
  * centralized write-tool approval wording.
  */
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { adfToText, textToAdf } from "./adf.js";
-import { jiraDownload, jiraJson } from "./client.js";
+import { adfToText, normalizeDescriptionField, textToAdf } from "./adf.js";
+import { jiraDownloadFiles, jiraJson, jiraUploadAttachments } from "./client.js";
 import { createIssue, getCreateMetadata, type CreateIssueParams, type CreateMetaParams } from "./create.js";
 import { normalizeOutputDir, resolveWorkspace } from "./config.js";
-import { createRunDirectory, exportIssueIntoRun, randomSuffix, safeFileName, textResult, timestampForPath, writeManifest } from "./exporter.js";
-import { attachmentMetadata, browseUrl, commentsSummaryText, issueSummaryText, transitionSummary } from "./format.js";
-import { fetchAllComments, fetchIssue, mergeFields, searchIssues, uniqueStrings, type SearchIssuesParams } from "./issues.js";
+import { createRunDirectory, exportIssueIntoRun, randomSuffix, safeFileName, textResult, timestampForPath, writeExportFile } from "./exporter.js";
+import { attachmentMetadata, browseUrl, commentsSummaryText, compactIssue, issueSummaryText, transitionSummary } from "./format.js";
+import { fetchAllComments, fetchIssue, fetchIssues, mergeFields, searchAllIssueKeys, searchIssues, uniqueStrings, type SearchIssuesParams } from "./issues.js";
 import {
 	DEFAULT_ISSUE_FIELDS,
+	DEFAULT_SEARCH_FIELDS,
 	type ExportedIssuePaths,
-	type JiraComment,
-	type JiraIssueLink,
 	type JiraIssueRef,
 	type JiraTransition,
 	type JiraWorkspace,
@@ -83,13 +82,15 @@ function registerJiraTool<P extends JiraPayload>(pi: ExtensionAPI, spec: JiraToo
 
 type IssueKeyParams = { issueKey: string };
 type IssueReadParams = IssueKeyParams & { fields?: string[]; expand?: string[] };
-type ExportIssueParams = IssueKeyParams & { outputDir?: string };
+type IssueReadsParams = { issueIdsOrKeys: string[]; fields?: string[]; expand?: string[] };
 type ExportIssuesParams = { issueKeys?: string[]; jql?: string; maxResults?: number; outputDir?: string };
-type DownloadAttachmentParams = IssueKeyParams & { attachmentId: string; outputDir?: string };
+type UploadAttachmentsParams = IssueKeyParams & { filePaths: string[] };
+type DownloadAttachmentsParams = IssueKeyParams & { attachmentIds: string[]; outputDir?: string };
+type DeleteIssueParams = IssueKeyParams & { deleteSubtasks?: boolean };
 type CommentBodyParams = IssueKeyParams & { body: string };
 type CommentUpdateParams = CommentBodyParams & { commentId: string };
 type CommentDeleteParams = IssueKeyParams & { commentId: string };
-type EditIssueParams = IssueKeyParams & { fields?: JiraPayload; update?: JiraPayload; notifyUsers?: boolean };
+type EditIssueParams = IssueKeyParams & { fields?: Record<string, unknown>; update?: Record<string, unknown>; notifyUsers?: boolean };
 type AssignIssueParams = IssueKeyParams & { accountId: string | null };
 type TransitionListParams = IssueKeyParams & { expand?: string[] };
 type TransitionIssueParams = IssueKeyParams & { transitionId: string; fields?: JiraPayload; update?: JiraPayload };
@@ -101,6 +102,16 @@ function defineJiraTool<P extends JiraPayload>(spec: JiraToolSpec<P>): JiraToolS
 	return spec;
 }
 
+function requireRecord(value: unknown, operation: string): Record<string, unknown> {
+	if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`${operation} returned an invalid object response.`);
+	return value as Record<string, unknown>;
+}
+
+function issueRef(value: unknown): JiraIssueRef | undefined {
+	if (!value || typeof value !== "object" || typeof (value as JiraIssueRef).key !== "string") return undefined;
+	return value as JiraIssueRef;
+}
+
 const toolSpecs = [
 	defineJiraTool<SearchIssuesParams>({
 		name: "jira_search",
@@ -109,8 +120,10 @@ const toolSpecs = [
 		promptSnippet: "Search mapped Jira issues using explicit JQL.",
 		parameters: Type.Object({
 			jql: Type.String({ description: "Required JQL query." }),
-			maxResults: Type.Optional(Type.Number({ description: "Maximum results. Defaults to 50." })),
-			fields: Type.Optional(Type.Array(Type.String({ description: "Additional Jira fields to fetch. description/comment are blocked here." }))),
+			maxResults: Type.Optional(Type.Integer({ minimum: 1, maximum: 100, description: "Maximum results for this page. Defaults to 50." })),
+			fields: Type.Optional(
+				Type.Array(Type.String({ description: "Additional Jira fields to fetch and show compactly. description/comment are blocked here." })),
+			),
 			nextPageToken: Type.Optional(Type.String({ description: "Jira nextPageToken for manual pagination." })),
 		}),
 		run: ({ workspace, params, signal }) => searchIssues(workspace, params, signal),
@@ -133,6 +146,26 @@ const toolSpecs = [
 			};
 		},
 	}),
+	defineJiraTool<IssueReadsParams>({
+		name: "jira_get_issues",
+		label: "Jira Issues",
+		description: "Read up to 100 explicit mapped Jira issues as compact candidate summaries. Use jira_get_issue for full descriptions or raw details.",
+		promptSnippet: "Read multiple explicit Jira issues in one bulk request.",
+		parameters: Type.Object({
+			issueIdsOrKeys: Type.Array(Type.String({ description: "Jira issue id or key." }), { minItems: 1, maxItems: 100 }),
+			fields: Type.Optional(Type.Array(Type.String({ description: "Additional Jira fields to fetch." }))),
+			expand: Type.Optional(Type.Array(Type.String({ description: "Jira expand values." }))),
+		}),
+		async run({ workspace, params, signal }) {
+			const result = await fetchIssues(workspace, params.issueIdsOrKeys, mergeFields(DEFAULT_SEARCH_FIELDS, params.fields), params.expand, signal);
+			const issues = result.issues.map((issue) => compactIssue(workspace, issue, params.fields));
+			const text = issues.map((issue) => `[${issue.key}](${issue.url})${issue.status ? ` [${issue.status}]` : ""} — ${issue.summary}`).join("\n");
+			return {
+				text: `${text || "No Jira issues returned."}${result.issueErrors.length ? `\n\nIssue errors: ${JSON.stringify(result.issueErrors)}` : ""}`,
+				details: { issues, issueErrors: result.issueErrors },
+			};
+		},
+	}),
 	defineJiraTool<IssueKeyParams>({
 		name: "jira_get_comments",
 		label: "Jira Comments",
@@ -140,32 +173,10 @@ const toolSpecs = [
 		promptSnippet: "Read comments for one Jira issue.",
 		parameters: Type.Object({ issueKey: Type.String({ description: "Issue key, e.g. ABC-123." }) }),
 		async run({ workspace, params, signal }) {
-			const issue = await fetchIssue(workspace, params.issueKey, ["project"], undefined, signal);
-			const comments = await fetchAllComments(workspace, issue.key, signal);
+			const comments = await fetchAllComments(workspace, params.issueKey, signal);
 			return {
-				text: commentsSummaryText(issue.key, comments),
-				details: { issueKey: issue.key, comments: comments.map((comment) => ({ ...comment, text: adfToText(comment.body) })) },
-			};
-		},
-	}),
-	defineJiraTool<ExportIssueParams>({
-		name: "jira_export_issue",
-		label: "Jira Export Issue",
-		description: "Export one mapped Jira issue, comments, and attachment metadata to files. Attachment bodies are not downloaded.",
-		promptSnippet: "Export one Jira issue and comments to JSON/Markdown files without downloading attachments.",
-		parameters: Type.Object({
-			issueKey: Type.String({ description: "Issue key, e.g. ABC-123." }),
-			outputDir: Type.Optional(Type.String({ description: "Optional base directory for this export run." })),
-		}),
-		async run({ workspace, params, signal, ctx }) {
-			const baseDir = params.outputDir ? normalizeOutputDir(params.outputDir, ctx.cwd) : workspace.exportBaseDir;
-			const runDir = await createRunDirectory(baseDir);
-			const issuePaths = await exportIssueIntoRun(workspace, params.issueKey, runDir, signal);
-			const manifestPath = join(runDir, "manifest.json");
-			await writeManifest(manifestPath, manifest(workspace, runDir, [issuePaths]));
-			return {
-				text: `Exported ${issuePaths.issueKey} to ${issuePaths.directory}\nManifest: ${manifestPath}`,
-				details: { manifestPath, runDir, issues: [issuePaths] },
+				text: commentsSummaryText(params.issueKey, comments),
+				details: { issueKey: params.issueKey, comments: comments.map((comment) => ({ ...comment, text: adfToText(comment.body) })) },
 			};
 		},
 	}),
@@ -177,7 +188,7 @@ const toolSpecs = [
 		parameters: Type.Object({
 			issueKeys: Type.Optional(Type.Array(Type.String({ description: "Issue keys to export." }))),
 			jql: Type.Optional(Type.String({ description: "JQL query to search, then export returned issues." })),
-			maxResults: Type.Optional(Type.Number({ description: "Maximum JQL results. Defaults to 50." })),
+			maxResults: Type.Optional(Type.Integer({ minimum: 1, description: "Maximum total JQL results. Defaults to 50." })),
 			outputDir: Type.Optional(Type.String({ description: "Optional base directory for this export run." })),
 		}),
 		async run({ workspace, params, signal, ctx }) {
@@ -187,8 +198,7 @@ const toolSpecs = [
 
 			let issueKeys: string[];
 			if (hasJql) {
-				const search = await searchIssues(workspace, { jql: params.jql, maxResults: params.maxResults, fields: ["project", "summary"] }, signal);
-				issueKeys = search.details.issues.map((issue) => issue.key);
+				issueKeys = await searchAllIssueKeys(workspace, params.jql ?? "", params.maxResults ?? 50, signal);
 			} else {
 				issueKeys = uniqueStrings(params.issueKeys ?? []);
 			}
@@ -199,32 +209,64 @@ const toolSpecs = [
 			for (const issueKey of issueKeys) issues.push(await exportIssueIntoRun(workspace, issueKey, runDir, signal));
 
 			const manifestPath = join(runDir, "manifest.json");
-			await writeManifest(manifestPath, manifest(workspace, runDir, issues));
+			await writeExportFile(manifestPath, `${JSON.stringify(manifest(workspace, runDir, issues), null, 2)}\n`);
 			return { text: `Exported ${issues.length} Jira issue(s) to ${runDir}\nManifest: ${manifestPath}`, details: { manifestPath, runDir, issues } };
 		},
 	}),
-	defineJiraTool<DownloadAttachmentParams>({
-		name: "jira_download_attachment",
-		label: "Jira Download Attachment",
-		description: "Download one explicit Jira attachment after verifying the issue project and attachment membership. No size cap is applied.",
-		promptSnippet: "Download an explicitly named Jira attachment by issue key and attachment id.",
+	defineJiraTool<UploadAttachmentsParams>({
+		name: "jira_upload_attachments",
+		label: "Jira Upload Attachments",
+		description: "Upload explicit local files to one mapped Jira issue through Jira's documented attachment endpoint.",
+		promptSnippet: "Upload explicitly named local files to a Jira issue only after explicit user approval.",
+		mutates: true,
+		approvalHint: "Show issue key, site, and exact resolved file paths before approval.",
 		parameters: Type.Object({
-			issueKey: Type.String({ description: "Issue key that owns the attachment." }),
-			attachmentId: Type.String({ description: "Jira attachment id." }),
-			outputDir: Type.Optional(Type.String({ description: "Optional directory to write the attachment into." })),
+			issueKey: Type.String({ description: "Issue key that will receive the attachments." }),
+			filePaths: Type.Array(Type.String({ description: "Local file path to upload. Relative paths resolve from the active workspace." }), { minItems: 1 }),
+		}),
+		async run({ workspace, params, signal, ctx }) {
+			const filePaths = uniqueStrings(params.filePaths).map((filePath) => resolve(ctx.cwd, filePath));
+			if (!filePaths.length) throw new Error("jira_upload_attachments requires at least one file path.");
+			const attachments = await jiraUploadAttachments(workspace, params.issueKey, filePaths, signal);
+			return {
+				text: `Uploaded ${attachments.length} attachment(s) to ${params.issueKey}\n${attachments.map((attachment) => `${attachment.id ?? "?"}: ${attachment.filename ?? "unnamed"}`).join("\n")}`,
+				details: { issueKey: params.issueKey, filePaths, attachments },
+			};
+		},
+	}),
+	defineJiraTool<DownloadAttachmentsParams>({
+		name: "jira_download_attachments",
+		label: "Jira Download Attachments",
+		description: "Download multiple explicit attachments after one issue-membership verification. Existing files are never overwritten.",
+		promptSnippet: "Download explicitly named Jira attachments from one issue.",
+		parameters: Type.Object({
+			issueKey: Type.String({ description: "Issue key that owns the attachments." }),
+			attachmentIds: Type.Array(Type.String({ description: "Jira attachment id." }), { minItems: 1 }),
+			outputDir: Type.Optional(Type.String({ description: "Optional directory to write the attachments into." })),
 		}),
 		async run({ workspace, params, signal, ctx }) {
 			const issue = await fetchIssue(workspace, params.issueKey, ["project", "attachment"], undefined, signal);
-			const attachment = attachmentMetadata(issue).find((item) => item.id === String(params.attachmentId));
-			if (!attachment) throw new Error(`Attachment ${params.attachmentId} is not listed on ${issue.key}.`);
+			const ids = uniqueStrings(params.attachmentIds);
+			const available = attachmentMetadata(issue);
+			const attachments = ids.map((id) => available.find((attachment) => attachment.id === id));
+			const missing = ids.filter((_, index) => !attachments[index]);
+			if (missing.length) throw new Error(`Attachments ${missing.join(", ")} are not listed on ${issue.key}.`);
 			const outputDir = params.outputDir
 				? normalizeOutputDir(params.outputDir, ctx.cwd)
-				: join(workspace.exportBaseDir, `attachment-${timestampForPath()}-${randomSuffix()}`);
-			const outputPath = join(outputDir, safeFileName(attachment.filename ?? "", `attachment-${params.attachmentId}`));
-			await jiraDownload(workspace, `/attachment/content/${encodeURIComponent(params.attachmentId)}`, outputPath, signal);
+				: join(workspace.exportBaseDir, `attachments-${timestampForPath()}-${randomSuffix()}`);
+			const downloads = attachments.flatMap((attachment) => {
+				if (!attachment) return [];
+				const filename = safeFileName(attachment.filename ?? "", `attachment-${attachment.id}`);
+				return [{ attachment, outputPath: join(outputDir, `${attachment.id}-${filename}`) }];
+			});
+			await jiraDownloadFiles(
+				workspace,
+				downloads.map(({ attachment, outputPath }) => ({ apiPath: `/attachment/content/${encodeURIComponent(attachment.id)}`, outputPath })),
+				signal,
+			);
 			return {
-				text: `Downloaded attachment ${params.attachmentId} from ${issue.key} to ${outputPath}`,
-				details: { issueKey: issue.key, attachment, outputPath },
+				text: `Downloaded ${downloads.length} attachment(s) from ${issue.key} to ${outputDir}`,
+				details: { issueKey: issue.key, outputDir, downloads },
 			};
 		},
 	}),
@@ -241,14 +283,17 @@ const toolSpecs = [
 			body: Type.String({ description: "Comment body. Supports Markdown-style links [text](https://...) and bare URLs." }),
 		}),
 		async run({ workspace, params, signal }) {
-			const issue = await fetchIssue(workspace, params.issueKey, ["project"], undefined, signal);
-			const comment = await jiraJson<JiraComment>(workspace, "POST", `/issue/${encodeURIComponent(issue.key)}/comment`, {
-				body: { body: textToAdf(params.body) },
-				signal,
-			});
+			const comment = requireRecord(
+				await jiraJson(workspace, "POST", `/issue/${encodeURIComponent(params.issueKey)}/comment`, {
+					body: { body: textToAdf(params.body) },
+					signal,
+				}),
+				"Jira add comment",
+			);
+			if (typeof comment.id !== "string") throw new Error(`Jira add comment on ${params.issueKey} returned no comment id.`);
 			return {
-				text: `Created comment ${comment.id} on ${issue.key}\nURL: ${browseUrl(workspace, issue.key)}\n\n${params.body}`,
-				details: { issueKey: issue.key, comment, text: params.body },
+				text: `Created comment ${comment.id} on ${params.issueKey}\nURL: ${browseUrl(workspace, params.issueKey)}\n\n${params.body}`,
+				details: { issueKey: params.issueKey, comment, text: params.body },
 			};
 		},
 	}),
@@ -266,12 +311,15 @@ const toolSpecs = [
 			body: Type.String({ description: "Replacement comment body. Supports Markdown-style links [text](https://...) and bare URLs." }),
 		}),
 		async run({ workspace, params, signal }) {
-			const issue = await fetchIssue(workspace, params.issueKey, ["project"], undefined, signal);
-			const comment = await jiraJson<JiraComment>(workspace, "PUT", `/issue/${encodeURIComponent(issue.key)}/comment/${encodeURIComponent(params.commentId)}`, {
-				body: { body: textToAdf(params.body) },
-				signal,
-			});
-			return { text: `Updated comment ${params.commentId} on ${issue.key}`, details: { issueKey: issue.key, comment, text: params.body } };
+			const comment = requireRecord(
+				await jiraJson(workspace, "PUT", `/issue/${encodeURIComponent(params.issueKey)}/comment/${encodeURIComponent(params.commentId)}`, {
+					body: { body: textToAdf(params.body) },
+					signal,
+				}),
+				"Jira update comment",
+			);
+			if (typeof comment.id !== "string") throw new Error(`Jira update comment ${params.commentId} on ${params.issueKey} returned no comment id.`);
+			return { text: `Updated comment ${params.commentId} on ${params.issueKey}`, details: { issueKey: params.issueKey, comment, text: params.body } };
 		},
 	}),
 	defineJiraTool<CommentDeleteParams>({
@@ -286,9 +334,11 @@ const toolSpecs = [
 			commentId: Type.String({ description: "Jira comment id." }),
 		}),
 		async run({ workspace, params, signal }) {
-			const issue = await fetchIssue(workspace, params.issueKey, ["project"], undefined, signal);
-			await jiraJson<void>(workspace, "DELETE", `/issue/${encodeURIComponent(issue.key)}/comment/${encodeURIComponent(params.commentId)}`, { signal });
-			return { text: `Deleted comment ${params.commentId} on ${issue.key}`, details: { issueKey: issue.key, commentId: params.commentId, deleted: true } };
+			await jiraJson(workspace, "DELETE", `/issue/${encodeURIComponent(params.issueKey)}/comment/${encodeURIComponent(params.commentId)}`, { signal });
+			return {
+				text: `Deleted comment ${params.commentId} on ${params.issueKey}`,
+				details: { issueKey: params.issueKey, commentId: params.commentId, deleted: true },
+			};
 		},
 	}),
 	defineJiraTool<CreateMetaParams>({
@@ -325,17 +375,39 @@ const toolSpecs = [
 		}),
 		run: ({ workspace, params, signal }) => createIssue(workspace, params, signal),
 	}),
+	defineJiraTool<DeleteIssueParams>({
+		name: "jira_delete_issue",
+		label: "Jira Delete Issue",
+		description: "Permanently delete one mapped Jira issue by key.",
+		promptSnippet: "Permanently delete a Jira issue only after explicit user approval.",
+		mutates: true,
+		approvalHint: "Show issue key, site, and whether subtasks will also be deleted before approval.",
+		parameters: Type.Object({
+			issueKey: Type.String({ description: "Issue key to permanently delete." }),
+			deleteSubtasks: Type.Optional(Type.Boolean({ description: "Delete subtasks too. Defaults to false." })),
+		}),
+		async run({ workspace, params, signal }) {
+			const deleteSubtasks = params.deleteSubtasks ?? false;
+			await jiraJson(workspace, "DELETE", `/issue/${encodeURIComponent(params.issueKey)}`, { query: { deleteSubtasks }, signal });
+			return { text: `Deleted Jira issue ${params.issueKey}`, details: { issueKey: params.issueKey, deleteSubtasks, deleted: true } };
+		},
+	}),
 	defineJiraTool<IssueKeyParams>({
 		name: "jira_get_editmeta",
 		label: "Jira Edit Metadata",
-		description: "Inspect editable fields for one mapped Jira issue before editing it.",
-		promptSnippet: "Inspect Jira editable field metadata for one issue.",
+		description:
+			"Inspect editable fields for one mapped Jira issue. Use only for unknown or site-specific fields; standard fields such as description do not require this call.",
+		promptSnippet: "Inspect Jira edit metadata only when an unknown or site-specific field requires it.",
 		parameters: Type.Object({ issueKey: Type.String({ description: "Issue key, e.g. ABC-123." }) }),
 		async run({ workspace, params, signal }) {
-			const issue = await fetchIssue(workspace, params.issueKey, ["project"], undefined, signal);
-			const editmeta = await jiraJson<Record<string, unknown>>(workspace, "GET", `/issue/${encodeURIComponent(issue.key)}/editmeta`, { signal });
-			const fields = Object.keys((editmeta.fields as Record<string, unknown> | undefined) ?? {});
-			return { text: `Editable fields for ${issue.key}: ${fields.length}\n${fields.join("\n")}`, details: { issueKey: issue.key, editmeta } };
+			const editmeta = requireRecord(
+				await jiraJson(workspace, "GET", `/issue/${encodeURIComponent(params.issueKey)}/editmeta`, { signal }),
+				"Jira edit metadata",
+			);
+			if (!editmeta?.fields || typeof editmeta.fields !== "object" || Array.isArray(editmeta.fields))
+				throw new Error(`Jira edit metadata for ${params.issueKey} returned invalid fields.`);
+			const fields = Object.keys(editmeta.fields as Record<string, unknown>);
+			return { text: `Editable fields for ${params.issueKey}: ${fields.length}\n${fields.join("\n")}`, details: { issueKey: params.issueKey, editmeta } };
 		},
 	}),
 	defineJiraTool<EditIssueParams>({
@@ -346,21 +418,23 @@ const toolSpecs = [
 		mutates: true,
 		parameters: Type.Object({
 			issueKey: Type.String({ description: "Issue key, e.g. ABC-123." }),
-			fields: Type.Optional(Type.Record(Type.String(), Type.Unknown(), { description: "Jira fields payload." })),
+			fields: Type.Optional(Type.Record(Type.String(), Type.Unknown(), { description: "Jira fields payload. String description is converted to Jira ADF." })),
 			update: Type.Optional(Type.Record(Type.String(), Type.Unknown(), { description: "Jira update payload." })),
-			notifyUsers: Type.Optional(Type.Boolean({ description: "Whether Jira should notify users." })),
+			notifyUsers: Type.Optional(
+				Type.Boolean({ description: "Whether Jira should notify users. Suppressing notifications may require Jira admin permission." }),
+			),
 		}),
 		async run({ workspace, params, signal }) {
-			const issue = await fetchIssue(workspace, params.issueKey, ["project"], undefined, signal);
 			if (params.fields === undefined && params.update === undefined) throw new Error("jira_edit_issue requires fields or update.");
-			await jiraJson<void>(workspace, "PUT", `/issue/${encodeURIComponent(issue.key)}`, {
+			const fields = params.fields ? normalizeDescriptionField(params.fields) : undefined;
+			await jiraJson(workspace, "PUT", `/issue/${encodeURIComponent(params.issueKey)}`, {
 				query: params.notifyUsers === undefined ? undefined : { notifyUsers: params.notifyUsers },
-				body: { ...(params.fields !== undefined ? { fields: params.fields } : {}), ...(params.update !== undefined ? { update: params.update } : {}) },
+				body: { ...(fields !== undefined ? { fields } : {}), ...(params.update !== undefined ? { update: params.update } : {}) },
 				signal,
 			});
 			return {
-				text: `Edited issue ${issue.key}`,
-				details: { issueKey: issue.key, fields: params.fields, update: params.update, notifyUsers: params.notifyUsers, success: true },
+				text: `Edited issue ${params.issueKey}`,
+				details: { issueKey: params.issueKey, fields, update: params.update, notifyUsers: params.notifyUsers, success: true },
 			};
 		},
 	}),
@@ -375,11 +449,10 @@ const toolSpecs = [
 			accountId: Type.Union([Type.String(), Type.Null()], { description: "Jira accountId, or null to unassign when permitted." }),
 		}),
 		async run({ workspace, params, signal }) {
-			const issue = await fetchIssue(workspace, params.issueKey, ["project"], undefined, signal);
-			await jiraJson<void>(workspace, "PUT", `/issue/${encodeURIComponent(issue.key)}/assignee`, { body: { accountId: params.accountId }, signal });
+			await jiraJson(workspace, "PUT", `/issue/${encodeURIComponent(params.issueKey)}/assignee`, { body: { accountId: params.accountId }, signal });
 			return {
-				text: `${params.accountId ? "Assigned" : "Unassigned"} ${issue.key}`,
-				details: { issueKey: issue.key, accountId: params.accountId, success: true },
+				text: `${params.accountId ? "Assigned" : "Unassigned"} ${params.issueKey}`,
+				details: { issueKey: params.issueKey, accountId: params.accountId, success: true },
 			};
 		},
 	}),
@@ -393,13 +466,17 @@ const toolSpecs = [
 			expand: Type.Optional(Type.Array(Type.String({ description: "Optional expand values, e.g. transitions.fields." }))),
 		}),
 		async run({ workspace, params, signal }) {
-			const issue = await fetchIssue(workspace, params.issueKey, ["project"], undefined, signal);
-			const response = await jiraJson<{ transitions?: JiraTransition[] }>(workspace, "GET", `/issue/${encodeURIComponent(issue.key)}/transitions`, {
-				query: params.expand?.length ? { expand: uniqueStrings(params.expand).join(",") } : undefined,
-				signal,
-			});
-			const transitions = Array.isArray(response?.transitions) ? response.transitions : [];
-			return { text: transitionSummary(transitions), details: { issueKey: issue.key, transitions, rawResponse: response } };
+			const response = requireRecord(
+				await jiraJson(workspace, "GET", `/issue/${encodeURIComponent(params.issueKey)}/transitions`, {
+					query: params.expand?.length ? { expand: uniqueStrings(params.expand).join(",") } : undefined,
+					signal,
+				}),
+				"Jira transitions",
+			);
+			if (!Array.isArray(response.transitions) || response.transitions.some((transition) => !transition || typeof transition !== "object"))
+				throw new Error(`Jira transitions for ${params.issueKey} returned an invalid response.`);
+			const transitions = response.transitions as JiraTransition[];
+			return { text: transitionSummary(transitions), details: { issueKey: params.issueKey, transitions } };
 		},
 	}),
 	defineJiraTool<TransitionIssueParams>({
@@ -415,8 +492,7 @@ const toolSpecs = [
 			update: Type.Optional(Type.Record(Type.String(), Type.Unknown(), { description: "Optional transition update payload." })),
 		}),
 		async run({ workspace, params, signal }) {
-			const issue = await fetchIssue(workspace, params.issueKey, ["project"], undefined, signal);
-			await jiraJson<void>(workspace, "POST", `/issue/${encodeURIComponent(issue.key)}/transitions`, {
+			await jiraJson(workspace, "POST", `/issue/${encodeURIComponent(params.issueKey)}/transitions`, {
 				body: {
 					transition: { id: params.transitionId },
 					...(params.fields !== undefined ? { fields: params.fields } : {}),
@@ -425,8 +501,8 @@ const toolSpecs = [
 				signal,
 			});
 			return {
-				text: `Applied transition ${params.transitionId} to ${issue.key}`,
-				details: { issueKey: issue.key, transitionId: params.transitionId, fields: params.fields, update: params.update, success: true },
+				text: `Applied transition ${params.transitionId} to ${params.issueKey}`,
+				details: { issueKey: params.issueKey, transitionId: params.transitionId, fields: params.fields, update: params.update, success: true },
 			};
 		},
 	}),
@@ -437,17 +513,14 @@ const toolSpecs = [
 		promptSnippet: "List Jira issue link types available on the mapped site.",
 		parameters: Type.Object({}),
 		async run({ workspace, signal }) {
-			const response = await jiraJson<{ issueLinkTypes?: Array<{ id?: string; name?: string; inward?: string; outward?: string }> }>(
-				workspace,
-				"GET",
-				"/issueLinkType",
-				{ signal },
-			);
-			const linkTypes = Array.isArray(response?.issueLinkTypes) ? response.issueLinkTypes : [];
+			const response = requireRecord(await jiraJson(workspace, "GET", "/issueLinkType", { signal }), "Jira issue link types");
+			if (!Array.isArray(response.issueLinkTypes) || response.issueLinkTypes.some((type) => !type || typeof type !== "object"))
+				throw new Error("Jira issue link types returned an invalid response.");
+			const linkTypes = response.issueLinkTypes as Array<Record<string, unknown>>;
 			const text =
 				linkTypes.map((type) => `${type.id}: ${type.name} (inward: ${type.inward}; outward: ${type.outward})`).join("\n") ||
 				"No Jira issue link types returned.";
-			return { text, details: { linkTypes, rawResponse: response } };
+			return { text, details: { linkTypes } };
 		},
 	}),
 	defineJiraTool<LinkIssuesParams>({
@@ -468,20 +541,18 @@ const toolSpecs = [
 			const hasTypeName = typeof params.typeName === "string" && params.typeName.length > 0;
 			const hasTypeId = typeof params.typeId === "string" && params.typeId.length > 0;
 			if (hasTypeName === hasTypeId) throw new Error("jira_link_issues requires exactly one of typeName or typeId.");
-			const inwardIssue = await fetchIssue(workspace, params.inwardIssueKey, ["project"], undefined, signal);
-			const outwardIssue = await fetchIssue(workspace, params.outwardIssueKey, ["project"], undefined, signal);
 			const body: Record<string, unknown> = {
 				type: hasTypeId ? { id: params.typeId } : { name: params.typeName },
-				inwardIssue: { key: inwardIssue.key },
-				outwardIssue: { key: outwardIssue.key },
+				inwardIssue: { key: params.inwardIssueKey },
+				outwardIssue: { key: params.outwardIssueKey },
 			};
 			if (params.comment) body.comment = { body: textToAdf(params.comment) };
-			await jiraJson<void>(workspace, "POST", "/issueLink", { body, signal });
+			await jiraJson(workspace, "POST", "/issueLink", { body, signal });
 			return {
-				text: `Linked ${inwardIssue.key} and ${outwardIssue.key} with ${hasTypeId ? `type id ${params.typeId}` : `type ${params.typeName}`}`,
+				text: `Linked ${params.inwardIssueKey} and ${params.outwardIssueKey} with ${hasTypeId ? `type id ${params.typeId}` : `type ${params.typeName}`}`,
 				details: {
-					inwardIssueKey: inwardIssue.key,
-					outwardIssueKey: outwardIssue.key,
+					inwardIssueKey: params.inwardIssueKey,
+					outwardIssueKey: params.outwardIssueKey,
 					typeName: params.typeName,
 					typeId: params.typeId,
 					comment: params.comment,
@@ -498,10 +569,10 @@ const toolSpecs = [
 		mutates: true,
 		parameters: Type.Object({ linkId: Type.String({ description: "Jira issue link id." }) }),
 		async run({ workspace, params, signal }) {
-			const link = await jiraJson<JiraIssueLink>(workspace, "GET", `/issueLink/${encodeURIComponent(params.linkId)}`, { signal });
-			const linkedIssues = [link?.inwardIssue, link?.outwardIssue].filter((issue): issue is JiraIssueRef => Boolean(issue));
+			const link = requireRecord(await jiraJson(workspace, "GET", `/issueLink/${encodeURIComponent(params.linkId)}`, { signal }), "Jira issue link");
+			const linkedIssues = [issueRef(link.inwardIssue), issueRef(link.outwardIssue)].filter((issue): issue is JiraIssueRef => Boolean(issue));
 			if (linkedIssues.length === 0) throw new Error(`Blocked Jira issue link ${params.linkId}: no linked issues found.`);
-			await jiraJson<void>(workspace, "DELETE", `/issueLink/${encodeURIComponent(params.linkId)}`, { signal });
+			await jiraJson(workspace, "DELETE", `/issueLink/${encodeURIComponent(params.linkId)}`, { signal });
 			return {
 				text: `Deleted Jira issue link ${params.linkId}`,
 				details: { linkId: params.linkId, linkedIssueKeys: linkedIssues.map((issue) => issue.key), deleted: true },
@@ -510,7 +581,7 @@ const toolSpecs = [
 	}),
 ];
 
-/** Build the common export manifest shape for single and batch exports. */
+/** Build the export manifest. */
 function manifest(workspace: JiraWorkspace, runDir: string, issues: ExportedIssuePaths[]) {
 	return {
 		generatedAt: new Date().toISOString(),

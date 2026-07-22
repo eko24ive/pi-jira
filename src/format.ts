@@ -5,7 +5,7 @@
  * attachment-safe: metadata only, never attachment bodies.
  */
 import { adfToText } from "./adf.js";
-import type { CompactIssue, JiraAttachment, JiraAttachmentDto, JiraComment, JiraIssue, JiraNamed, JiraTransition, JiraUser, JiraWorkspace } from "./types.js";
+import type { CompactIssue, JiraAttachmentDto, JiraComment, JiraIssue, JiraNamed, JiraTransition, JiraUser, JiraWorkspace } from "./types.js";
 
 /** Return the most useful stable display name Jira exposed for a user. */
 export function displayName(user: JiraUser | null | undefined): string {
@@ -34,36 +34,40 @@ export function browseUrl(workspace: JiraWorkspace, issueKey: string): string {
 	return `${workspace.siteUrl}/browse/${encodeURIComponent(issueKey)}`;
 }
 
-function attachmentFromDto(attachment: JiraAttachmentDto): JiraAttachment {
-	return {
-		id: String(attachment.id),
-		filename: attachment.filename,
-		size: attachment.size,
-		mimeType: attachment.mimeType,
-		created: attachment.created,
-		author: attachment.author,
-		content: attachment.content,
-	};
-}
-
 /** Extract attachment metadata without downloading attachment bodies. */
-export function attachmentMetadata(issue: JiraIssue): JiraAttachment[] {
+export function attachmentMetadata(issue: JiraIssue): Array<JiraAttachmentDto & { id: string }> {
 	const attachments = issue.fields?.attachment;
 	if (!Array.isArray(attachments)) return [];
-	return attachments.filter((attachment) => attachment.id !== undefined).map(attachmentFromDto);
+	return attachments.filter((attachment) => attachment.id !== undefined).map((attachment) => ({ ...attachment, id: String(attachment.id) }));
+}
+
+const DISPLAYED_SEARCH_FIELDS = new Set(["summary", "status", "issuetype", "priority", "assignee", "parent", "updated"]);
+
+function compactFieldValue(value: unknown): unknown {
+	if (value === null || typeof value === "string" || typeof value === "number" || typeof value === "boolean") return value;
+	if (Array.isArray(value)) return value.map(compactFieldValue);
+	if (!value || typeof value !== "object") return String(value);
+	const record = value as Record<string, unknown>;
+	return record.displayName ?? record.name ?? record.value ?? record.key ?? record.id ?? "[object]";
 }
 
 /** Convert a raw Jira issue into the compact shape returned by `jira_search`. */
-export function compactIssue(issue: JiraIssue): CompactIssue {
+export function compactIssue(workspace: JiraWorkspace, issue: JiraIssue, requestedFields: string[] = []): CompactIssue {
 	const fields = issue.fields ?? {};
+	const requestedEntries = requestedFields
+		.filter((field) => !DISPLAYED_SEARCH_FIELDS.has(field.toLowerCase()) && fields[field] !== undefined)
+		.map((field) => [field, compactFieldValue(fields[field])]);
 	return {
 		key: issue.key,
+		url: browseUrl(workspace, issue.key),
 		summary: fields.summary ?? "",
 		status: fieldName(fields.status) || undefined,
 		type: fieldName(fields.issuetype) || undefined,
 		priority: fieldName(fields.priority) || undefined,
 		assignee: fields.assignee ? displayName(fields.assignee) : undefined,
+		parentKey: fields.parent?.key,
 		updated: fields.updated,
+		requestedFields: requestedEntries.length ? Object.fromEntries(requestedEntries) : undefined,
 	};
 }
 

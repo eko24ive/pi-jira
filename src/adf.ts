@@ -151,6 +151,13 @@ function inlineTextToAdf(text: string): InlineAdfNode[] {
 	return nodes;
 }
 
+/** Convert a string description field to ADF while preserving raw ADF objects. */
+export function normalizeDescriptionField(fields: Record<string, unknown>): Record<string, unknown> {
+	const normalized = { ...fields };
+	if (typeof normalized.description === "string") normalized.description = textToAdf(normalized.description);
+	return normalized;
+}
+
 /** Convert comment text into minimal ADF, linkifying Markdown-style links and bare URLs. */
 export function textToAdf(text: string) {
 	const normalized = text.replace(/\r\n/g, "\n");

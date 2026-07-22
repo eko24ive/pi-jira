@@ -1,6 +1,6 @@
 # @eko24ive/pi-jira
 
-Pi package for Jira Cloud work from mapped local workspaces. It exposes named Jira tools for search, reads, issue creation, exports, attachment downloads, comments, issue edits, transitions, and issue links.
+Pi package for Jira Cloud work from mapped local workspaces. It exposes named Jira tools for search, reads, issue creation and deletion, exports, attachment uploads and downloads, comments, issue edits, transitions, and issue links.
 
 ## Install
 
@@ -85,12 +85,14 @@ Config rules:
 | --- | --- | --- |
 | Find issues | `jira_search` with explicit JQL | relying on a hidden default query |
 | Read one issue | `jira_get_issue` | broad search fields for descriptions/comments |
+| Read multiple issues | `jira_get_issues` | repeated `jira_get_issue` calls |
 | Read comments | `jira_get_comments` | fetching comments through search |
-| Save issue/comments/metadata | `jira_export_issue` / `jira_export_issues` | downloading attachment bodies implicitly |
-| Download an attachment | `jira_download_attachment` | using attachment id without issue verification |
+| Save issue/comments | `jira_export_issues` | downloading attachment bodies implicitly |
+| Upload attachments | `jira_upload_attachments` | uploading before explicit user approval |
+| Download attachments | `jira_download_attachments` | repeated issue-membership checks |
 | Add/edit/delete comment | `jira_add_comment` / `jira_update_comment` / `jira_delete_comment` | calling before explicit user approval |
 | Inspect creatable fields | `jira_get_createmeta` | guessing required create fields |
-| Create an issue | `jira_create_issue` | creating before explicit user approval |
+| Create/delete an issue | `jira_create_issue` / `jira_delete_issue` | mutating before explicit user approval |
 | Inspect editable fields | `jira_get_editmeta` | guessing raw field names |
 | Edit/assign/transition | `jira_edit_issue` / `jira_assign_issue` / `jira_transition_issue` | field-specific wrappers in v1 |
 | Work with links | `jira_get_link_types` / `jira_link_issues` / `jira_delete_issue_link` | generic REST calls |
@@ -99,13 +101,13 @@ Config rules:
 
 ### `jira_search`
 
-Search Jira with explicit JQL. Does not return descriptions or comments.
+Search Jira with explicit JQL. Does not return descriptions or comments. Results always include browse links and parent keys when present; explicitly requested extra fields are shown in compact form. Raw Jira search payloads are not retained in session details.
 
 ```ts
 {
   jql: string;
-  maxResults?: number;    // default 50
-  fields?: string[];      // extra fields, description/comment blocked
+  maxResults?: number;    // page size, 1–100; default 50
+  fields?: string[];      // extra fields shown compactly; description/comment blocked
   nextPageToken?: string;
 }
 ```
@@ -122,30 +124,31 @@ Read one issue and return compact text plus raw JSON details.
 }
 ```
 
-### `jira_get_comments`
+### `jira_get_issues`
 
-Fetch all comment pages for one issue.
+Bulk-read up to 100 explicit issue IDs or keys as compact candidate summaries. Use `jira_get_issue` when a full description or raw issue details are needed.
 
 ```ts
 {
-  issueKey: string;
+  issueIdsOrKeys: string[];
+  fields?: string[];
+  expand?: string[];
 }
 ```
 
-### `jira_export_issue`
+### `jira_get_comments`
 
-Export issue JSON/Markdown, comments JSON/Markdown, and attachment metadata. Attachment bodies are not downloaded.
+Fetch and validate all comment pages for one issue.
 
 ```ts
 {
   issueKey: string;
-  outputDir?: string;
 }
 ```
 
 ### `jira_export_issues`
 
-Batch export by explicit keys or by JQL search results.
+Batch export by explicit keys or by JQL search results. JQL exports follow `nextPageToken` until the requested total is reached.
 
 ```ts
 {
@@ -158,14 +161,25 @@ Batch export by explicit keys or by JQL search results.
 
 Exactly one of `issueKeys` or `jql` is required.
 
-### `jira_download_attachment`
+### `jira_upload_attachments`
 
-Download one explicit attachment. `issueKey` is required so the tool can verify the attachment is listed on that issue before download.
+Upload one or more explicit local files through Jira's documented REST attachment endpoint. Relative paths resolve from the active workspace, and every path is validated before the request starts. Files are uploaded unchanged; the extension does not transcode videos.
 
 ```ts
 {
   issueKey: string;
-  attachmentId: string;
+  filePaths: string[];
+}
+```
+
+### `jira_download_attachments`
+
+Download several attachments from one issue after a single membership check. Filenames are prefixed with attachment IDs to prevent local collisions after sanitization.
+
+```ts
+{
+  issueKey: string;
+  attachmentIds: string[];
   outputDir?: string;
 }
 ```
@@ -211,7 +225,18 @@ Example:
 }
 ```
 
-If `fields.description` is a string, `jira_create_issue` converts it to Jira ADF and linkifies Markdown-style links/bare URLs. If `fields.description` is already an object, it is sent as-is.
+If `fields.description` is a string, `jira_create_issue` converts it to Jira ADF and linkifies Markdown-style links/bare URLs. `jira_edit_issue` applies the same conversion. If `fields.description` is already an object, it is sent as-is.
+
+### `jira_delete_issue`
+
+Permanently delete one issue directly by key. Jira refuses deletion when subtasks exist unless `deleteSubtasks` is explicitly enabled.
+
+```ts
+{
+  issueKey: string;
+  deleteSubtasks?: boolean; // default false
+}
+```
 
 ### Write tools
 
@@ -221,6 +246,8 @@ These tools mutate Jira:
 - `jira_update_comment`
 - `jira_delete_comment`
 - `jira_create_issue`
+- `jira_delete_issue`
+- `jira_upload_attachments`
 - `jira_edit_issue`
 - `jira_assign_issue`
 - `jira_transition_issue`
@@ -268,15 +295,17 @@ Jira disabled here: cwd is not under any configured jira workspace root.
 - Uses Jira Cloud REST API v3 under `/rest/api/3`.
 - Uses Basic auth with `email:apiToken`.
 - JSON calls send `Accept: application/json` and `Content-Type: application/json` when a body is present.
-- Download calls stream to disk through Pi's file mutation queue.
+- All attachment uploads use Jira's documented multipart REST endpoint with the required `X-Atlassian-Token: no-check` header.
+- Download calls stream to a temporary sibling file through Pi's mutation queue, then rename atomically; existing files are never overwritten.
 - Non-2xx responses throw concise Jira errors; 429 includes `Retry-After` when present.
+- JSON endpoints reject malformed successful responses instead of casting text to typed data.
 
 ### Output and files
 
 - Tool output is bounded with Pi's truncation utilities.
 - Truncated full output is saved under `export.baseDir/tool-output/`.
 - Export runs create timestamped directories under `export.baseDir` unless `outputDir` is provided.
-- Attachment bodies are downloaded only by `jira_download_attachment`.
+- Attachment bodies are uploaded only by `jira_upload_attachments` and downloaded only by `jira_download_attachments`.
 
 ### ADF handling
 
@@ -284,7 +313,7 @@ Jira descriptions/comments use Atlassian Document Format.
 
 - Reads use best-effort `adfToText` for model-readable text.
 - Comment writes use minimal `textToAdf` conversion.
-- Create writes convert string `fields.description` with the same `textToAdf` helper.
+- Create and edit writes convert string `fields.description` with the same `textToAdf` helper.
 - `textToAdf` linkifies Markdown-style links and bare `https://...` URLs.
 - There is no general Markdown parser in v1.
 

@@ -6,22 +6,10 @@
  * boundary because Jira field schemas are site-specific.
  */
 export const CONFIG_DISPLAY_PATH = "~/.pi/agent/jira.json";
+// biome-ignore lint/suspicious/noTemplateCurlyInString: ${USER} is expanded later as a configured path placeholder.
 export const DEFAULT_EXPORT_BASE_DIR = "/tmp/pi-jira-${USER}";
 
-export const DEFAULT_SEARCH_FIELDS = [
-	"project",
-	"summary",
-	"status",
-	"issuetype",
-	"priority",
-	"assignee",
-	"reporter",
-	"labels",
-	"components",
-	"created",
-	"updated",
-	"parent",
-];
+export const DEFAULT_SEARCH_FIELDS = ["summary", "status", "issuetype", "priority", "assignee", "updated", "parent"];
 
 export const DEFAULT_ISSUE_FIELDS = [
 	"project",
@@ -104,16 +92,6 @@ export type JiraAttachmentDto = {
 	content?: string;
 };
 
-export type JiraAttachment = {
-	id: string;
-	filename?: string;
-	size?: number;
-	mimeType?: string;
-	created?: string;
-	author?: JiraUser;
-	content?: string;
-};
-
 export type JiraIssueRef = {
 	key?: string;
 	fields?: {
@@ -166,12 +144,15 @@ export type JiraComment = {
 
 export type CompactIssue = {
 	key: string;
+	url: string;
 	summary: string;
 	status?: string;
 	type?: string;
 	priority?: string;
 	assignee?: string;
+	parentKey?: string;
 	updated?: string;
+	requestedFields?: Record<string, unknown>;
 };
 
 export type JiraTransition = {
@@ -188,8 +169,6 @@ export type ExportedIssuePaths = {
 	issueMarkdown: string;
 	commentsJson: string;
 	commentsMarkdown: string;
-	attachmentsJson: string;
-	attachmentsDirectory: string;
 };
 
 /** Tool handler output before shared truncation/result wrapping. */

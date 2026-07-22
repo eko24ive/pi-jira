@@ -34,11 +34,8 @@
 		"build:smoke": "bun build index.ts --target=node --outfile=/tmp/pi-jira-index.js --external @earendil-works/pi-coding-agent --external typebox",
 		"format": "biome format --write .",
 		"lint": "biome lint --write .",
-		"check": "ultracite check",
-		"check:ci": "biome ci .",
-		"fix": "ultracite fix",
-		"commit": "cz",
-		"commitlint": "commitlint"
+		"check": "biome check .",
+		"check:ci": "biome ci ."
 	},
 	"pi": {
 		"extensions": [
@@ -51,18 +48,7 @@
 	},
 	"devDependencies": {
 		"@biomejs/biome": "2.4.12",
-		"@commitlint/cli": "^19.8.1",
-		"@commitlint/config-conventional": "^19.8.1",
 		"@earendil-works/pi-coding-agent": "0.80.10",
-		"commitizen": "^4.3.1",
-		"cz-conventional-changelog": "^3.3.0",
-		"lefthook": "^2.1.6",
-		"typebox": "1.1.38",
-		"ultracite": "7.6.0"
-	},
-	"config": {
-		"commitizen": {
-			"path": "./node_modules/cz-conventional-changelog"
-		}
+		"typebox": "1.1.38"
 	}
 }
